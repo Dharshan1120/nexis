@@ -1,0 +1,8 @@
+{"type":"ready","recognizer":"windows-speech"}
+{"state":"Listening","type":"audio-state"}
+{"confidence":0.627,"type":"final","text":"F"}
+{"state":"Listening","type":"audio-state"}
+{"confidence":0.439,"type":"final","text":"F"}
+{"state":"Listening","type":"audio-state"}
+{"confidence":0.377,"type":"final","text":"F"}
+{"state":"Listening","type":"audio-state"}

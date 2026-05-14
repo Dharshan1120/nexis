@@ -1,0 +1,40 @@
+{
+  "name": "nexis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "NEXIS futuristic desktop AI assistant",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "start": "npm run dev",
+    "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
+    "dev:ui": "vite",
+    "dev:electron": "npm run build:electron && wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "build": "npm run build:ui && npm run build:electron",
+    "build:ui": "vite build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.0",
+    "framer-motion": "^12.12.1",
+    "lucide-react": "^0.511.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zustand": "^5.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.1",
+    "@types/react": "^19.1.6",
+    "@types/react-dom": "^19.1.5",
+    "@vitejs/plugin-react": "^4.5.2",
+    "autoprefixer": "^10.4.21",
+    "concurrently": "^9.1.2",
+    "cross-env": "^10.0.0",
+    "electron": "^35.2.0",
+    "postcss": "^8.5.4",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "wait-on": "^8.0.3"
+  }
+}
