@@ -12,6 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from intent_engine import run_command
+
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
@@ -86,18 +88,6 @@ def create_memory(payload: dict[str, Any]) -> dict[str, Any]:
         return {"id": cursor.lastrowid, "stored": True}
     finally:
         connection.close()
-
-
-def run_command(text: str) -> dict[str, Any]:
-    normalized = text.strip().lower()
-
-    if normalized == "open chrome":
-        return {"ok": True, "response": "Launching Chrome."}
-
-    if normalized.startswith("remember "):
-        return {"ok": True, "response": "Stored."}
-
-    return {"ok": False, "response": "Command not recognized yet."}
 
 
 def _load_whisper_background() -> None:

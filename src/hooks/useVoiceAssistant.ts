@@ -76,11 +76,16 @@ function shouldRejectTranscription(result: {
     return "Non-English transcript rejected";
   }
 
-  if (typeof result.noSpeechProb === "number" && result.noSpeechProb > 0.95) {
-    return "Background audio rejected";
+  // Strict confidence filtering for background noise/hallucinations
+  if (typeof result.noSpeechProb === "number" && result.noSpeechProb > 0.55) {
+    return "High no-speech probability rejected";
   }
 
-  if (typeof result.compressionRatio === "number" && result.compressionRatio > 4) {
+  if (typeof result.avgLogprob === "number" && result.avgLogprob < -0.75) {
+    return "Low confidence transcript rejected";
+  }
+
+  if (typeof result.compressionRatio === "number" && result.compressionRatio > 2.5) {
     return "Unstable transcript rejected";
   }
 
@@ -110,12 +115,14 @@ export function useVoiceAssistant() {
   const [micError, setMicError] = useState<string | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [audioLevel, setAudioLevel] = useState(0.18);
+  const [isAwake, setIsAwake] = useState(false);
   const [deviceLabel, setDeviceLabel] = useState("Windows default microphone");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const transcribingRef = useRef(false);
   const voiceArmedRef = useRef(true);
   const speakingRef = useRef(false);
+  const isAwakeRef = useRef(false);
   const pendingChunksRef = useRef<Blob[]>([]);
   const levelRef = useRef(0);
   const lastSpeechAtRef = useRef(0);
@@ -177,8 +184,10 @@ export function useVoiceAssistant() {
     mediaRecorderRef.current = recorder;
     setIsListening(true);
     setMode("listening");
-    setVoiceStatus("Listening");
-    setSubtitle("I am listening.");
+    setVoiceStatus(isAwakeRef.current ? "Active listening" : "Passive standby");
+    if (isAwakeRef.current) {
+      setSubtitle("Listening...");
+    }
   };
 
   useEffect(() => {
@@ -220,25 +229,52 @@ export function useVoiceAssistant() {
         audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(stream);
         analyser = audioContext.createAnalyser();
-        analyser.fftSize = 256;
-        analyser.smoothingTimeConstant = 0.82;
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.5; // Fast response for VAD
         dataArray = new Uint8Array(analyser.frequencyBinCount);
         source.connect(analyser);
+
+        const sampleRate = audioContext.sampleRate;
+        const binSize = sampleRate / analyser.fftSize;
+        const speechStartBin = Math.floor(300 / binSize);
+        const speechEndBin = Math.floor(3400 / binSize);
 
         const tick = () => {
           if (!analyser || !dataArray) {
             return;
           }
 
-          analyser.getByteFrequencyData(dataArray);
-          const average =
-            dataArray.reduce((sum, value) => sum + value, 0) / (dataArray.length * 255);
-          levelRef.current = average;
-          setAudioLevel(Math.max(0.08, Math.min(1, average * 3.5)));
+          if (speakingRef.current) {
+            levelRef.current = 0;
+            setAudioLevel(0.08);
+            setMicLevelLabel("Suppressed (Speaking)");
+            animationFrame = window.requestAnimationFrame(tick);
+            return;
+          }
 
-          if (average > 0.1) {
-            setMicLevelLabel("Strong audio");
-          } else if (average > 0.035) {
+          analyser.getByteFrequencyData(dataArray);
+          
+          // Speech Frequency Band Energy (300Hz - 3400Hz)
+          let speechEnergy = 0;
+          let peakEnergy = 0;
+          for (let i = speechStartBin; i <= speechEndBin; i++) {
+            speechEnergy += dataArray[i];
+            if (dataArray[i] > peakEnergy) {
+              peakEnergy = dataArray[i];
+            }
+          }
+          const averageSpeechEnergy = speechEnergy / (speechEndBin - speechStartBin + 1) / 255;
+          const normalizedPeak = peakEnergy / 255;
+          
+          // Use peak energy for quicker onset detection, blended with average
+          const combinedEnergy = (averageSpeechEnergy * 0.7) + (normalizedPeak * 0.3);
+          
+          levelRef.current = combinedEnergy;
+          setAudioLevel(Math.max(0.08, Math.min(1, combinedEnergy * 3.5)));
+
+          if (combinedEnergy > 0.18) {
+            setMicLevelLabel("Speech detected");
+          } else if (combinedEnergy > 0.1) {
             setMicLevelLabel("Audio detected");
           } else {
             setMicLevelLabel("Quiet");
@@ -266,7 +302,8 @@ export function useVoiceAssistant() {
       const level = levelRef.current;
       const activeRecorder = mediaRecorderRef.current;
 
-      if (level > 0.04) {
+      // Requires a much higher energy threshold to break silence and start recording
+      if (level > 0.12) {
         lastSpeechAtRef.current = now;
         lastInteractionAtRef.current = now;
         startRecorder();
@@ -275,14 +312,22 @@ export function useVoiceAssistant() {
       if (activeRecorder?.state === "recording") {
         const recordingFor = now - recorderStartedAtRef.current;
         const silenceFor = now - lastSpeechAtRef.current;
-        if (recordingFor > 7600 || (recordingFor > 1000 && silenceFor > 1200)) {
+        
+        // Dynamic silence timeout based on mode
+        const silenceTimeout = isAwakeRef.current ? 1500 : 900;
+        const maxDuration = isAwakeRef.current ? 9000 : 4000;
+
+        // Stop if we hit max duration, OR if we've recorded enough and had enough silence
+        if (recordingFor > maxDuration || (recordingFor > 800 && silenceFor > silenceTimeout)) {
           stopRecorder();
         }
       }
 
-      if (!activeRecorder && now - lastInteractionAtRef.current > 18000) {
+      if (!activeRecorder && isAwakeRef.current && now - lastInteractionAtRef.current > 15000) {
+        isAwakeRef.current = false;
+        setIsAwake(false);
         setMode("idle");
-        setVoiceStatus("Standby");
+        setVoiceStatus("Passive standby");
         setSubtitle(randomStandbyLine());
         lastInteractionAtRef.current = now;
       }
@@ -333,13 +378,43 @@ export function useVoiceAssistant() {
         return;
       }
 
+      if (speakingRef.current) {
+        return; // Prevent self-listening/feedback loops completely
+      }
+
+      const rawText = result.text.trim();
       const text = cleanTranscript(result.text);
+      const isWakeWord = /^(hey nexis|nexis|nexus|hey nexus)\b/i.test(rawText);
+
+      // Wake Word Gating Logic
+      if (!isAwakeRef.current) {
+        if (isWakeWord) {
+          isAwakeRef.current = true;
+          setIsAwake(true);
+          lastInteractionAtRef.current = Date.now();
+          
+          if (!text) {
+            // User just said "Hey Nexis"
+            speakBriefly("I'm listening.", undefined, () => {
+              setMode("idle");
+              setVoiceStatus("Active listening");
+              setSubtitle("I am listening.");
+            });
+            return;
+          }
+        } else {
+          // Ignore background speech unless we're actively listening
+          setVoiceStatus("Passive standby");
+          setSubtitle("Waiting for wake word (Hey NEXIS).");
+          return;
+        }
+      }
 
       const now = Date.now();
       const sameAsLast = text.toLowerCase() === lastTranscriptRef.current.toLowerCase();
       if (sameAsLast && now - lastTranscriptAtRef.current < 3500) {
         setVoiceStatus("Duplicate voice fragment ignored");
-        setSubtitle("Still listening.");
+        setSubtitle(isAwakeRef.current ? "Listening..." : "Passive standby.");
         return;
       }
 
@@ -348,7 +423,7 @@ export function useVoiceAssistant() {
 
       if (isLowSignalTranscript(text)) {
         setVoiceStatus("Low-signal voice fragment ignored");
-        setSubtitle("Still listening.");
+        setSubtitle(isAwakeRef.current ? "Listening..." : "Passive standby.");
         return;
       }
 
@@ -366,6 +441,8 @@ export function useVoiceAssistant() {
         addTranscript("nexis", "Voice paused.");
         voiceArmedRef.current = false;
         setIsListening(false);
+        isAwakeRef.current = false;
+        setIsAwake(false);
         speakBriefly("Voice paused.", undefined, () => {
           setMode("idle");
           setVoiceStatus("Voice paused");
@@ -396,8 +473,12 @@ export function useVoiceAssistant() {
           speakingRef.current = false;
           if (voiceArmedRef.current) {
             setMode("idle");
-            setVoiceStatus("Always listening");
-            setSubtitle(randomStandbyLine());
+            setVoiceStatus(isAwakeRef.current ? "Active listening" : "Passive standby");
+            if (!isAwakeRef.current) {
+              setSubtitle(randomStandbyLine());
+            } else {
+              setSubtitle("Listening...");
+            }
           }
         }
       );
@@ -441,6 +522,7 @@ export function useVoiceAssistant() {
     deviceLabel,
     interimTranscript,
     isListening,
+    isAwake,
     isSupported,
     micError,
     startListening,

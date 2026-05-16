@@ -30,9 +30,9 @@ function extractJson(text: string) {
   return JSON.parse(text.slice(first, last + 1)) as IntentDecision;
 }
 
-function heuristicDecision(input: string): IntentDecision | null {
+async function heuristicDecision(input: string): Promise<IntentDecision | null> {
   const normalized = input.toLowerCase().trim();
-  const direct = resolveSystemCommand(input);
+  const direct = await resolveSystemCommand(input);
   if (direct) {
     return {
       mode: "action",
@@ -63,7 +63,7 @@ export async function classifyIntent({
   getEnvValue,
   memory
 }: IntentOptions): Promise<IntentDecision> {
-  const heuristic = heuristicDecision(input);
+  const heuristic = await heuristicDecision(input);
   if (heuristic) {
     return heuristic;
   }
