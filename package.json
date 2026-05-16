@@ -6,6 +6,7 @@
   "main": "dist-electron/main.js",
   "scripts": {
     "start": "npm run dev",
+    "predev": "powershell -NoProfile -Command \"@(5173,8765) | ForEach-Object { Get-NetTCPConnection -LocalPort $_ -ErrorAction SilentlyContinue | Where-Object OwningProcess -gt 0 | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } }; Write-Host '[predev] ports cleared'\"",
     "dev": "concurrently -k \"npm:dev:ui\" \"npm:dev:electron\"",
     "dev:ui": "vite",
     "dev:electron": "npm run build:electron && wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",

@@ -11,5 +11,6 @@ contextBridge.exposeInMainWorld("nexis", {
     audioBytes: number[];
     mimeType: string;
     fileName: string;
-  }) => ipcRenderer.invoke("assistant:transcribe-audio", payload)
+  }) => ipcRenderer.invoke("assistant:transcribe-audio", payload),
+  getSystemStats: () => ipcRenderer.invoke("assistant:system-stats")
 });

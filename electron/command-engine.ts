@@ -8,6 +8,8 @@ export type CommandResult = {
   response: string;
   commandId?: string;
   normalized?: string;
+  needsConfirmation?: boolean;
+  source?: "direct" | "ai" | "fallback" | "confirmation";
 };
 
 type CommandContext = {
@@ -22,6 +24,32 @@ type CommandDefinition = {
   run: (context: CommandContext) => Promise<void> | void;
 };
 
+export type CommandSuggestion = {
+  actionId: string;
+  response: string;
+  confidence: number;
+  phrase: string;
+  normalized: string;
+};
+
+const appActionWords = [
+  "open",
+  "launch",
+  "start",
+  "close",
+  "kill",
+  "quit",
+  "exit",
+  "show",
+  "go to",
+  "browse",
+  "search",
+  "watch",
+  "play",
+  "need",
+  "want"
+];
+
 function cleanCommand(command: string) {
   return command
     .toLowerCase()
@@ -30,8 +58,105 @@ function cleanCommand(command: string) {
     .trim();
 }
 
-function hasAny(text: string, words: string[]) {
-  return words.some((word) => text.includes(word));
+function escapeRegex(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function hasPhrase(text: string, phrases: string[]) {
+  return phrases.some((phrase) => {
+    const pattern = escapeRegex(phrase).replace(/\s+/g, "\\s+");
+    return new RegExp(`\\b${pattern}\\b`).test(text);
+  });
+}
+
+function hasActionWord(text: string) {
+  return hasPhrase(text, appActionWords);
+}
+
+function mentionsNotepad(text: string) {
+  return hasPhrase(text, ["notepad", "note pad"]);
+}
+
+function mentionsFileManager(text: string) {
+  return hasPhrase(text, ["file manager", "file explorer", "explorer", "files"]);
+}
+
+function isNoiseProneCommand(text: string) {
+  const fillerPhrases = [
+    "i will manage",
+    "i'll manage",
+    "home manager",
+    "phone manager",
+    "don't need it",
+    "do not need it",
+    "might be easy",
+    "okay",
+    "ok"
+  ];
+
+  return hasPhrase(text, fillerPhrases) && !hasActionWord(text);
+}
+
+function wordsOf(text: string) {
+  return cleanCommand(text)
+    .split(" ")
+    .filter((word) => word.length > 0);
+}
+
+function levenshtein(a: string, b: string) {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const matrix = Array.from({ length: rows }, () => Array<number>(cols).fill(0));
+
+  for (let i = 0; i < rows; i += 1) {
+    matrix[i][0] = i;
+  }
+
+  for (let j = 0; j < cols; j += 1) {
+    matrix[0][j] = j;
+  }
+
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + cost
+      );
+    }
+  }
+
+  return matrix[a.length][b.length];
+}
+
+function similarity(a: string, b: string) {
+  const left = cleanCommand(a);
+  const right = cleanCommand(b);
+  const longest = Math.max(left.length, right.length);
+  if (longest === 0) {
+    return 1;
+  }
+
+  return 1 - levenshtein(left, right) / longest;
+}
+
+function bestWindowSimilarity(input: string, phrase: string) {
+  const inputWords = wordsOf(input);
+  const phraseWords = wordsOf(phrase);
+  if (inputWords.length === 0 || phraseWords.length === 0) {
+    return 0;
+  }
+
+  const windowSize = phraseWords.length;
+  let best = similarity(input, phrase);
+
+  for (let i = 0; i <= inputWords.length - windowSize; i += 1) {
+    const windowText = inputWords.slice(i, i + windowSize).join(" ");
+    best = Math.max(best, similarity(windowText, phrase));
+  }
+
+  return best;
 }
 
 function runDetached(command: string, args: string[] = []) {
@@ -74,7 +199,9 @@ const commandRegistry: CommandDefinition[] = [
   {
     id: "open_chrome",
     response: "Launching Chrome.",
-    match: (text) => hasAny(text, ["open chrome", "launch chrome"]) || (text.includes("open") && text.includes("browser")),
+    match: (text) =>
+      hasPhrase(text, ["open chrome", "launch chrome", "start chrome"]) ||
+      (hasPhrase(text, ["open browser", "launch browser", "start browser"]) && hasActionWord(text)),
     run: () => openApp("chrome")
   },
   {
@@ -86,7 +213,9 @@ const commandRegistry: CommandDefinition[] = [
   {
     id: "open_youtube",
     response: "Opening YouTube.",
-    match: (text) => text.includes("youtube") || text.includes("you tube"),
+    match: (text) =>
+      hasPhrase(text, ["open youtube", "launch youtube", "start youtube", "watch youtube", "play youtube"]) ||
+      hasPhrase(text, ["open you tube", "watch you tube", "play you tube"]),
     run: () => void shell.openExternal("https://www.youtube.com")
   },
   {
@@ -98,14 +227,32 @@ const commandRegistry: CommandDefinition[] = [
   {
     id: "open_notepad",
     response: "Opening Notepad.",
-    match: (text) => text.includes("open notepad") || (text.includes("open") && text.includes("note")),
+    match: (text) =>
+      hasPhrase(text, ["open notepad", "launch notepad", "start notepad", "open note pad", "launch note pad"]),
     run: () => runDetached("notepad.exe")
   },
   {
     id: "close_notepad",
     response: "Closing Notepad.",
-    match: (text) => text.includes("close notepad") || (text.includes("close") && text.includes("note")),
+    match: (text) =>
+      hasPhrase(text, ["close notepad", "kill notepad", "quit notepad", "close note pad", "kill note pad"]),
     run: () => killImage("notepad.exe")
+  },
+  {
+    id: "open_file_manager",
+    response: "Opening file manager.",
+    match: (text) =>
+      hasPhrase(text, [
+        "open file manager",
+        "launch file manager",
+        "start file manager",
+        "open file explorer",
+        "launch file explorer",
+        "open explorer",
+        "show files",
+        "open files"
+      ]),
+    run: () => runDetached("explorer.exe")
   },
   {
     id: "open_calculator",
@@ -239,22 +386,206 @@ const commandRegistry: CommandDefinition[] = [
   }
 ];
 
+const fuzzyActionPhrases: Array<{ id: string; phrases: string[] }> = [
+  {
+    id: "open_chrome",
+    phrases: ["open chrome", "launch chrome", "start chrome", "open browser", "need internet", "browse internet"]
+  },
+  {
+    id: "close_chrome",
+    phrases: ["close chrome", "kill chrome", "quit chrome"]
+  },
+  {
+    id: "open_youtube",
+    phrases: ["open youtube", "watch youtube", "play youtube", "open you tube", "watch videos"]
+  },
+  {
+    id: "open_google",
+    phrases: ["open google", "google search", "search google"]
+  },
+  {
+    id: "open_notepad",
+    phrases: ["open notepad", "launch notepad", "start notepad", "open note pad"]
+  },
+  {
+    id: "close_notepad",
+    phrases: ["close notepad", "kill notepad", "quit notepad", "close note pad"]
+  },
+  {
+    id: "open_file_manager",
+    phrases: ["open file manager", "open file explorer", "launch file explorer", "open explorer", "show files"]
+  },
+  {
+    id: "open_calculator",
+    phrases: ["open calculator", "open calc", "launch calculator"]
+  },
+  {
+    id: "close_calculator",
+    phrases: ["close calculator", "close calc", "kill calculator"]
+  },
+  {
+    id: "open_paint",
+    phrases: ["open paint", "open mspaint", "launch paint"]
+  },
+  {
+    id: "open_vscode",
+    phrases: ["open vs code", "open vscode", "open visual studio code", "launch vs code"]
+  },
+  {
+    id: "open_whatsapp",
+    phrases: ["open whatsapp", "open whats app", "launch whatsapp"]
+  },
+  {
+    id: "open_downloads",
+    phrases: ["open downloads", "downloads folder", "open downloads folder"]
+  },
+  {
+    id: "open_documents",
+    phrases: ["open documents", "documents folder", "open documents folder"]
+  },
+  {
+    id: "open_pictures",
+    phrases: ["open pictures", "pictures folder", "open pictures folder"]
+  },
+  {
+    id: "mute_volume",
+    phrases: ["mute volume", "mute sound", "silence volume"]
+  },
+  {
+    id: "volume_up",
+    phrases: ["volume up", "increase volume", "raise volume"]
+  },
+  {
+    id: "volume_down",
+    phrases: ["volume down", "decrease volume", "lower volume"]
+  }
+];
+
+export function getActionCatalog() {
+  return commandRegistry.map((definition) => ({
+    id: definition.id,
+    response: definition.response
+  }));
+}
+
 export function looksLikeSystemCommand(command: string) {
   const normalized = cleanCommand(command);
+  if (isNoiseProneCommand(normalized)) {
+    return false;
+  }
+
   return commandRegistry.some((definition) => definition.match(normalized));
 }
 
-export async function executeSystemCommand(
-  command: string,
-  context: CommandContext
-): Promise<CommandResult> {
+export function resolveSystemCommand(command: string) {
   const normalized = cleanCommand(command);
+  if (isNoiseProneCommand(normalized)) {
+    return null;
+  }
+
   const definition = commandRegistry.find((item) => item.match(normalized));
+
+  if (!definition) {
+    return null;
+  }
+
+  return {
+    id: definition.id,
+    response: definition.response,
+    normalized
+  };
+}
+
+export function suggestSystemAction(command: string): CommandSuggestion | null {
+  const normalized = cleanCommand(command);
+  if (!normalized || isNoiseProneCommand(normalized)) {
+    return null;
+  }
+
+  let best: CommandSuggestion | null = null;
+
+  for (const action of fuzzyActionPhrases) {
+    const definition = commandRegistry.find((item) => item.id === action.id);
+    if (!definition) {
+      continue;
+    }
+
+    for (const phrase of action.phrases) {
+      const confidence = bestWindowSimilarity(normalized, phrase);
+      if (!best || confidence > best.confidence) {
+        best = {
+          actionId: action.id,
+          response: definition.response,
+          confidence,
+          phrase,
+          normalized
+        };
+      }
+    }
+  }
+
+  if (!best || best.confidence < 0.66) {
+    return null;
+  }
+
+  return best;
+}
+
+export function getActionConfirmation(actionId: string, heard?: string) {
+  const definition = commandRegistry.find((item) => item.id === actionId);
+  if (!definition) {
+    return "I am not fully sure what to do. Please say it again.";
+  }
+
+  const target = definition.response.replace(/\.$/, "").toLowerCase();
+  const heardText = heard ? ` I heard "${heard}".` : "";
+  return `${heardText} Confirm ${target}? Say confirm to run it, or cancel.`;
+}
+
+export function canExecutePlannedAction(actionId: string, input: string, confidence = 0) {
+  const normalized = cleanCommand(input);
+
+  if (isNoiseProneCommand(normalized)) {
+    return false;
+  }
+
+  if (confidence < 0.78) {
+    return false;
+  }
+
+  if (actionId.includes("notepad")) {
+    return mentionsNotepad(normalized) && hasActionWord(normalized);
+  }
+
+  if (actionId === "open_file_manager") {
+    return mentionsFileManager(normalized) && hasActionWord(normalized);
+  }
+
+  if (actionId.includes("chrome")) {
+    return (
+      hasPhrase(normalized, ["chrome", "browser", "internet", "browse", "web"]) && hasActionWord(normalized)
+    );
+  }
+
+  if (actionId === "open_youtube") {
+    return hasPhrase(normalized, ["youtube", "you tube", "watch video", "watch something"]) && hasActionWord(normalized);
+  }
+
+  return hasActionWord(normalized);
+}
+
+export async function executeSystemAction(
+  actionId: string,
+  context: CommandContext,
+  normalized?: string
+): Promise<CommandResult> {
+  const definition = commandRegistry.find((item) => item.id === actionId);
 
   if (!definition) {
     return {
       ok: false,
       response: "Command not mapped yet.",
+      commandId: actionId,
       normalized
     };
   }
@@ -265,6 +596,70 @@ export async function executeSystemCommand(
     ok: true,
     response: definition.response,
     commandId: definition.id,
-    normalized
+    normalized,
+    source: "ai"
+  };
+}
+
+export async function executeSystemCommand(
+  command: string,
+  context: CommandContext
+): Promise<CommandResult> {
+  const normalized = cleanCommand(command);
+  if (isNoiseProneCommand(normalized)) {
+    return {
+      ok: false,
+      response: "I heard you, but I will not run a command from that.",
+      normalized,
+      source: "fallback"
+    };
+  }
+
+  const definition = commandRegistry.find((item) => item.match(normalized));
+
+  if (definition) {
+    await definition.run(context);
+
+    return {
+      ok: true,
+      response: definition.response,
+      commandId: definition.id,
+      normalized,
+      source: "direct"
+    };
+  }
+
+  const suggestion = suggestSystemAction(normalized);
+  if (suggestion?.confidence && suggestion.confidence >= 0.91 && canExecutePlannedAction(suggestion.actionId, normalized, 0.91)) {
+    const suggestedDefinition = commandRegistry.find((item) => item.id === suggestion.actionId);
+    if (suggestedDefinition) {
+      await suggestedDefinition.run(context);
+
+      return {
+        ok: true,
+        response: suggestedDefinition.response,
+        commandId: suggestedDefinition.id,
+        normalized,
+        source: "direct"
+      };
+    }
+  }
+
+  if (suggestion) {
+    return {
+      ok: false,
+      response: getActionConfirmation(suggestion.actionId, command),
+      commandId: suggestion.actionId,
+      normalized,
+      needsConfirmation: true,
+      source: "fallback"
+    };
+  }
+
+  return {
+    ok: false,
+    response: "I am not fully sure what you meant. Please say the command again.",
+    normalized,
+    source: "fallback"
   };
 }

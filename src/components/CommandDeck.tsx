@@ -16,8 +16,8 @@ export function CommandDeck() {
     }
 
     addTranscript("user", trimmed);
-    setMode("executing");
-    setSubtitle("Processing command...");
+    setMode("thinking");
+    setSubtitle("Reasoning through that...");
 
     const result = await window.nexis.executeCommand(trimmed);
 

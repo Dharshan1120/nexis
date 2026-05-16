@@ -1,8 +1,95 @@
 import { useEffect, useRef, useState } from "react";
 import { useNexisStore } from "../store/useNexisStore";
 
-function speakBriefly(text: string) {
+const standbyLines = [
+  "Ready when you are.",
+  "NEXIS online.",
+  "Standing by.",
+  "Good to see you again.",
+  "Welcome back.",
+  "Systems quiet. I am here."
+];
+
+function randomStandbyLine() {
+  return standbyLines[Math.floor(Math.random() * standbyLines.length)];
+}
+
+function cleanTranscript(text: string) {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/^(nexis|nexus|next is|axis)[, ]+/i, "")
+    .trim();
+}
+
+function containsForeignScript(text: string) {
+  return /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\u0600-\u06ff\u0400-\u04ff]/u.test(text);
+}
+
+function isEnglishLanguage(language?: string) {
+  if (!language) {
+    return true;
+  }
+
+  const normalized = language.toLowerCase().trim();
+  return normalized === "en" || normalized === "eng" || normalized === "english";
+}
+
+function isLowSignalTranscript(text: string) {
+  const normalized = text.toLowerCase().replace(/[^\w\s]/g, "").trim();
+  const ignored = new Set([
+    "okay",
+    "ok",
+    "hmm",
+    "um",
+    "uh",
+    "sorry",
+    "thanks",
+    "thank you"
+  ]);
+
+  if (ignored.has(normalized)) {
+    return true;
+  }
+
+  return normalized.length < 3;
+}
+
+function shouldRejectTranscription(result: {
+  text: string;
+  language?: string;
+  duration?: number;
+  avgLogprob?: number;
+  noSpeechProb?: number;
+  compressionRatio?: number;
+}) {
+  const text = cleanTranscript(result.text);
+
+  if (!text || isLowSignalTranscript(text)) {
+    return "Low-signal voice fragment ignored";
+  }
+
+  if (containsForeignScript(text)) {
+    return "Non-English/noisy transcript rejected";
+  }
+
+  if (!isEnglishLanguage(result.language)) {
+    return "Non-English transcript rejected";
+  }
+
+  if (typeof result.noSpeechProb === "number" && result.noSpeechProb > 0.95) {
+    return "Background audio rejected";
+  }
+
+  if (typeof result.compressionRatio === "number" && result.compressionRatio > 4) {
+    return "Unstable transcript rejected";
+  }
+
+  return null;
+}
+
+function speakBriefly(text: string, onStart?: () => void, onEnd?: () => void) {
   if (!("speechSynthesis" in window)) {
+    onEnd?.();
     return;
   }
 
@@ -11,67 +98,31 @@ function speakBriefly(text: string) {
   utterance.rate = 1.02;
   utterance.pitch = 0.94;
   utterance.volume = 1;
+  utterance.onstart = () => onStart?.();
+  utterance.onend = () => onEnd?.();
+  utterance.onerror = () => onEnd?.();
   window.speechSynthesis.speak(utterance);
 }
 
-function looksLikeCommand(text: string) {
-  const normalized = text.toLowerCase().trim();
-  if (!normalized) {
-    return false;
-  }
-
-  const commandHints = [
-    "open",
-    "close",
-    "notepad",
-    "chrome",
-    "youtube",
-    "google",
-    "calculator",
-    "calc",
-    "paint",
-    "vscode",
-    "vs code",
-    "visual studio code",
-    "whatsapp",
-    "downloads",
-    "desktop",
-    "documents",
-    "pictures",
-    "volume",
-    "mute",
-    "lock",
-    "shutdown",
-    "restart",
-    "minimize",
-    "hide",
-    "exit",
-    "quit",
-    "pause mic",
-    "stop listening",
-    "turn off",
-    "start mic",
-    "start listening",
-    "nexis",
-    "nexus"
-  ];
-
-  return commandHints.some((hint) => normalized.includes(hint));
-}
-
 export function useVoiceAssistant() {
-  const [isListening, setIsListening] = useState(false);
+  const [isListening, setIsListening] = useState(true);
   const [isSupported] = useState(true);
   const [micError, setMicError] = useState<string | null>(null);
   const [interimTranscript, setInterimTranscript] = useState("");
   const [audioLevel, setAudioLevel] = useState(0.18);
   const [deviceLabel, setDeviceLabel] = useState("Windows default microphone");
-  const [manualPause, setManualPause] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const transcribingRef = useRef(false);
-  const manualPauseRef = useRef(false);
+  const voiceArmedRef = useRef(true);
+  const speakingRef = useRef(false);
   const pendingChunksRef = useRef<Blob[]>([]);
+  const levelRef = useRef(0);
+  const lastSpeechAtRef = useRef(0);
+  const lastInteractionAtRef = useRef(Date.now());
+  const recorderStartedAtRef = useRef(0);
+  const lastTranscriptRef = useRef("");
+  const lastTranscriptAtRef = useRef(0);
   const setMode = useNexisStore((state) => state.setMode);
   const setSubtitle = useNexisStore((state) => state.setSubtitle);
   const addTranscript = useNexisStore((state) => state.addTranscript);
@@ -80,12 +131,63 @@ export function useVoiceAssistant() {
   const setActiveMicLabel = useNexisStore((state) => state.setActiveMicLabel);
   const setMicLevelLabel = useNexisStore((state) => state.setMicLevelLabel);
 
+  const stopRecorder = () => {
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state === "recording") {
+      recorder.stop();
+    }
+  };
+
+  const startRecorder = () => {
+    const stream = streamRef.current;
+    if (
+      !stream ||
+      !voiceArmedRef.current ||
+      speakingRef.current ||
+      transcribingRef.current ||
+      (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive")
+    ) {
+      return;
+    }
+
+    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      ? "audio/webm;codecs=opus"
+      : "audio/webm";
+
+    const recorder = new MediaRecorder(stream, { mimeType });
+    pendingChunksRef.current = [];
+    recorderStartedAtRef.current = Date.now();
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        pendingChunksRef.current.push(event.data);
+      }
+    };
+    recorder.onstop = () => {
+      const duration = Date.now() - recorderStartedAtRef.current;
+      const blob = new Blob(pendingChunksRef.current, { type: mimeType });
+      pendingChunksRef.current = [];
+      mediaRecorderRef.current = null;
+
+      if (blob.size > 1000 && duration > 550 && voiceArmedRef.current) {
+        void handleTranscription(blob);
+      }
+    };
+
+    recorder.start();
+    mediaRecorderRef.current = recorder;
+    setIsListening(true);
+    setMode("listening");
+    setVoiceStatus("Listening");
+    setSubtitle("I am listening.");
+  };
+
   useEffect(() => {
     let stream: MediaStream | null = null;
     let audioContext: AudioContext | null = null;
     let analyser: AnalyserNode | null = null;
     let dataArray: Uint8Array | null = null;
     let animationFrame = 0;
+    let activityInterval = 0;
 
     async function startMicMonitor() {
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -110,7 +212,11 @@ export function useVoiceAssistant() {
         }
 
         setVoicePermission("granted");
-        setVoiceStatus("Groq voice ready");
+        setIsListening(true);
+        setMode("idle");
+        setVoiceStatus("Always listening");
+        setSubtitle(randomStandbyLine());
+
         audioContext = new AudioContext();
         const source = audioContext.createMediaStreamSource(stream);
         analyser = audioContext.createAnalyser();
@@ -127,15 +233,15 @@ export function useVoiceAssistant() {
           analyser.getByteFrequencyData(dataArray);
           const average =
             dataArray.reduce((sum, value) => sum + value, 0) / (dataArray.length * 255);
-
+          levelRef.current = average;
           setAudioLevel(Math.max(0.08, Math.min(1, average * 3.5)));
 
-          if (average > 0.12) {
+          if (average > 0.1) {
             setMicLevelLabel("Strong audio");
-          } else if (average > 0.05) {
+          } else if (average > 0.035) {
             setMicLevelLabel("Audio detected");
           } else {
-            setMicLevelLabel("No audio detected");
+            setMicLevelLabel("Quiet");
           }
 
           animationFrame = window.requestAnimationFrame(tick);
@@ -151,18 +257,55 @@ export function useVoiceAssistant() {
 
     void startMicMonitor();
 
+    activityInterval = window.setInterval(() => {
+      if (!voiceArmedRef.current || speakingRef.current || transcribingRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+      const level = levelRef.current;
+      const activeRecorder = mediaRecorderRef.current;
+
+      if (level > 0.04) {
+        lastSpeechAtRef.current = now;
+        lastInteractionAtRef.current = now;
+        startRecorder();
+      }
+
+      if (activeRecorder?.state === "recording") {
+        const recordingFor = now - recorderStartedAtRef.current;
+        const silenceFor = now - lastSpeechAtRef.current;
+        if (recordingFor > 7600 || (recordingFor > 1000 && silenceFor > 1200)) {
+          stopRecorder();
+        }
+      }
+
+      if (!activeRecorder && now - lastInteractionAtRef.current > 18000) {
+        setMode("idle");
+        setVoiceStatus("Standby");
+        setSubtitle(randomStandbyLine());
+        lastInteractionAtRef.current = now;
+      }
+    }, 180);
+
     return () => {
+      window.clearInterval(activityInterval);
       if (animationFrame) {
         window.cancelAnimationFrame(animationFrame);
       }
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
+      stopRecorder();
       stream?.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
       void audioContext?.close();
     };
-  }, [setActiveMicLabel, setMicLevelLabel, setVoicePermission, setVoiceStatus]);
+  }, [
+    setActiveMicLabel,
+    setMicLevelLabel,
+    setMode,
+    setSubtitle,
+    setVoicePermission,
+    setVoiceStatus
+  ]);
 
   const handleTranscription = async (blob: Blob) => {
     if (transcribingRef.current || blob.size < 1500) {
@@ -171,8 +314,8 @@ export function useVoiceAssistant() {
 
     transcribingRef.current = true;
     setMode("thinking");
-    setVoiceStatus("Transcribing with Groq");
-    setSubtitle("Transcribing...");
+    setVoiceStatus("Interpreting voice input");
+    setSubtitle("Processing your voice...");
 
     try {
       const buffer = await blob.arrayBuffer();
@@ -182,17 +325,30 @@ export function useVoiceAssistant() {
         fileName: "nexis-voice.webm"
       });
 
-      const text = result.text.trim();
-      if (!text) {
-        setVoiceStatus("No speech detected");
-        setSubtitle("Listening...");
+      const rejectionReason = shouldRejectTranscription(result);
+      if (rejectionReason) {
+        const rejectedText = cleanTranscript(result.text);
+        setVoiceStatus(rejectionReason);
+        setSubtitle(rejectedText ? `${rejectionReason}: ${rejectedText}` : "Ignoring uncertain audio.");
         return;
       }
 
-      const normalized = text.toLowerCase();
-      if (!looksLikeCommand(text)) {
-        setVoiceStatus("Ignoring background speech");
-        setSubtitle("Press Start mic, then speak one command.");
+      const text = cleanTranscript(result.text);
+
+      const now = Date.now();
+      const sameAsLast = text.toLowerCase() === lastTranscriptRef.current.toLowerCase();
+      if (sameAsLast && now - lastTranscriptAtRef.current < 3500) {
+        setVoiceStatus("Duplicate voice fragment ignored");
+        setSubtitle("Still listening.");
+        return;
+      }
+
+      lastTranscriptRef.current = text;
+      lastTranscriptAtRef.current = now;
+
+      if (isLowSignalTranscript(text)) {
+        setVoiceStatus("Low-signal voice fragment ignored");
+        setSubtitle("Still listening.");
         return;
       }
 
@@ -200,6 +356,7 @@ export function useVoiceAssistant() {
       setSubtitle(`Heard: ${text}`);
       setInterimTranscript(text);
 
+      const normalized = text.toLowerCase();
       if (
         normalized.includes("pause mic") ||
         normalized.includes("stop listening") ||
@@ -207,103 +364,76 @@ export function useVoiceAssistant() {
         normalized.includes("turn off mic")
       ) {
         addTranscript("nexis", "Voice paused.");
-        speakBriefly("Voice paused.");
-        await stopListening();
+        voiceArmedRef.current = false;
+        setIsListening(false);
+        speakBriefly("Voice paused.", undefined, () => {
+          setMode("idle");
+          setVoiceStatus("Voice paused");
+          setSubtitle("Voice paused. I am standing by.");
+        });
         return;
       }
 
       const commandResult = await window.nexis.executeCommand(text);
       addTranscript("nexis", commandResult.response);
-      setMode(commandResult.ok ? "speaking" : "idle");
-      setVoiceStatus(commandResult.ok ? "Command executed" : "Awaiting next command");
+      setMode(commandResult.ok || commandResult.needsConfirmation ? "speaking" : "idle");
+      setVoiceStatus(
+        commandResult.needsConfirmation
+          ? "Awaiting confirmation"
+          : commandResult.ok
+            ? "Responding"
+            : "Companion standby"
+      );
       setSubtitle(commandResult.response);
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
-        mediaRecorderRef.current.stop();
-      }
-      speakBriefly(commandResult.response);
+      lastInteractionAtRef.current = Date.now();
+      speakBriefly(
+        commandResult.response,
+        () => {
+          speakingRef.current = true;
+          setMode("speaking");
+        },
+        () => {
+          speakingRef.current = false;
+          if (voiceArmedRef.current) {
+            setMode("idle");
+            setVoiceStatus("Always listening");
+            setSubtitle(randomStandbyLine());
+          }
+        }
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Transcription failed";
       setMicError(message);
       if (message.includes("429")) {
         setVoiceStatus("Groq rate limit hit");
-        setSubtitle("Groq is busy. Wait 5 seconds, then press Start mic again.");
+        setSubtitle("Groq is busy. Holding the channel for a moment.");
       } else {
         setVoiceStatus("Groq transcription failed");
         setSubtitle(message);
       }
     } finally {
       transcribingRef.current = false;
-      setIsListening(false);
-      setMode("idle");
-      setVoiceStatus("Voice paused");
-      window.setTimeout(() => {
-        setSubtitle("Press Start mic, then speak one command.");
-        setInterimTranscript("");
-      }, 900);
-      mediaRecorderRef.current = null;
+      setInterimTranscript("");
     }
   };
 
   const startListening = async () => {
-    setManualPause(false);
-    manualPauseRef.current = false;
+    voiceArmedRef.current = true;
     setMicError(null);
     setIsListening(true);
-    setMode("listening");
-    setVoiceStatus("Listening for one command");
-    setSubtitle("Speak one command now...");
-
-    const stream = streamRef.current;
-    if (!stream) {
-      setMicError("Microphone stream not ready");
-      return;
-    }
-
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      return;
-    }
-
-    const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-      ? "audio/webm;codecs=opus"
-      : "audio/webm";
-
-    const recorder = new MediaRecorder(stream, { mimeType });
-    pendingChunksRef.current = [];
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        pendingChunksRef.current.push(event.data);
-      }
-    };
-    recorder.onstop = () => {
-      const blob = new Blob(pendingChunksRef.current, { type: mimeType });
-      pendingChunksRef.current = [];
-      if (blob.size > 0 && !manualPauseRef.current) {
-        void handleTranscription(blob);
-      }
-    };
-    recorder.start();
-    mediaRecorderRef.current = recorder;
-    window.setTimeout(() => {
-      const activeRecorder = mediaRecorderRef.current;
-      if (activeRecorder && activeRecorder.state === "recording") {
-        activeRecorder.stop();
-      }
-    }, 3500);
+    setMode("idle");
+    setVoiceStatus("Always listening");
+    setSubtitle(randomStandbyLine());
   };
 
   const stopListening = async () => {
-    setManualPause(true);
-    manualPauseRef.current = true;
+    voiceArmedRef.current = false;
     setIsListening(false);
+    stopRecorder();
     setMode("idle");
     setVoiceStatus("Voice paused");
-    setSubtitle("Voice paused.");
+    setSubtitle("Voice paused. I am standing by.");
     setInterimTranscript("");
-
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
-    }
-    mediaRecorderRef.current = null;
   };
 
   return {

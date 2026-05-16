@@ -1,3 +1,1 @@
-# Foundation backend currently uses only the Python standard library.
-# Add Faster-Whisper, Edge TTS, Groq, and Supabase packages in the next phase,
-# ideally under Python 3.11 for best compatibility.
+faster-whisper>=1.1.1

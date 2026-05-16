@@ -9,11 +9,11 @@ import { useNexisStore } from "./store/useNexisStore";
 import { useVoiceAssistant } from "./hooks/useVoiceAssistant";
 
 const modeLabels = {
-  idle: "Passive companion",
-  listening: "Voice focus engaged",
-  thinking: "Synthesizing intent",
-  speaking: "Speaking naturally",
-  executing: "Running action"
+  idle: "Companion standby",
+  listening: "Listening channel open",
+  thinking: "Reasoning through context",
+  speaking: "Voice response active",
+  executing: "Executing operation"
 } as const;
 
 export default function App() {
@@ -85,7 +85,7 @@ export default function App() {
                 transition={{ duration: 0.8 }}
                 className="flex flex-col items-center"
               >
-                <Orb mode={mode} />
+                <Orb mode={mode} level={audioLevel} />
                 <Waveform level={audioLevel} />
               </motion.div>
 
@@ -94,7 +94,15 @@ export default function App() {
                   <p className="text-xs uppercase tracking-[0.45em] text-cyan-300/65">Live Subtitle</p>
                   <p className="text-xs text-cyan-200/75">Mic: {deviceLabel || activeMicLabel}</p>
                 </div>
-                <p className="mt-3 text-2xl text-cyan-50">{subtitle}</p>
+                <motion.p
+                  key={subtitle}
+                  initial={{ opacity: 0, y: 8, filter: "blur(6px)" }}
+                  animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                  transition={{ duration: 0.28, ease: "easeOut" }}
+                  className="mt-3 text-2xl text-cyan-50"
+                >
+                  {subtitle}
+                </motion.p>
                 {!isSupported ? (
                   <p className="mt-3 text-sm text-amber-300">
                     Speech recognition is not available in this Electron runtime yet.
